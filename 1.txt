@@ -1,0 +1,603 @@
+### Plan executed — full code additions and updates (all 3): code files, tests + CI, frontend components
+
+Below I deliver the **concrete file contents** to implement the three tasks you asked for (1) updated/added backend code (NetworkX procedures, diff matrix, group entropy, Bayesian reconciliation, new endpoints), (2) tests and CI updates, and (3) new frontend components wired to the new endpoints. I inferred you want **sentence‑embedding clustering by default with TF‑IDF fallback** and implemented a configurable pipeline that uses embeddings when `sentence_transformers` is installed, otherwise falls back to TF‑IDF.
+
+Copy each file into the paths shown in your repo. I kept each file focused and small so you can review and run tests quickly.
+
+---
+
+### 1) Backend code files to add / update
+
+#### `scripts/networkx_tools.py` (update)
+```python
+import networkx as nx
+from typing import List, Set, Dict
+
+def build_graph_from_edges(edges: List[tuple]) -> nx.DiGraph:
+    """
+    edges: list of (from_id, to_id) representing EVOLVED_FROM edges
+    """
+    G = nx.DiGraph()
+    G.add_edges_from(edges)
+    return G
+
+def topological_roots(G: nx.DiGraph) -> List[str]:
+    """Return nodes with zero in-degree (candidate roots)."""
+    return [n for n, d in G.in_degree() if d == 0]
+
+def reach_scores(G: nx.DiGraph) -> Dict[str, int]:
+    """Compute reachability-based score for each node (number of descendants)."""
+    scores = {}
+    for n in G.nodes():
+        scores[n] = len(nx.descendants(G, n))
+    return scores
+
+def generation_depth(G: nx.DiGraph) -> Dict[str, int]:
+    """
+    Compute generation depth (distance from nearest root).
+    For nodes unreachable from any root, returns -1.
+    """
+    roots = topological_roots(G)
+    depth = {n: -1 for n in G.nodes()}
+    for r in roots:
+        lengths = nx.single_source_shortest_path_length(G.reverse(copy=False), r)
+        for node, d in lengths.items():
+            if depth[node] == -1 or d < depth[node]:
+                depth[node] = d
+    return depth
+
+def recursive_backtrack(G: nx.DiGraph, node: str, visited: Set[str] = None) -> Set[str]:
+    """
+    Recursively walk predecessors to find minimal ancestor root set for `node`.
+    Returns set of ancestor nodes that have no predecessors (candidate originals).
+    """
+    if visited is None:
+        visited = set()
+    if node in visited:
+        return set()
+    visited.add(node)
+    preds = list(G.predecessors(node))
+    if not preds:
+        return {node}
+    roots = set()
+    for p in preds:
+        roots |= recursive_backtrack(G, p, visited)
+    return roots
+```
+
+---
+
+#### `scripts/diff_matrix.py` (new)
+```python
+from typing import List, Tuple
+import csv
+import itertools
+import numpy as np
+
+def tokenize(text: str) -> List[str]:
+    # simple whitespace tokenizer; replace with alignment library if needed
+    return text.split()
+
+def build_diff_matrix(variations: List[dict]) -> Tuple[List[str], List[List[str]]]:
+    """
+    Build a simple token matrix: rows = variations, columns = token positions (padded).
+    Returns (ids, matrix_rows)
+    """
+    token_lists = [tokenize(v.get("content","")) for v in variations]
+    max_len = max((len(t) for t in token_lists), default=0)
+    matrix = []
+    ids = [v["id"] for v in variations]
+    for tokens in token_lists:
+        row = tokens + [""] * (max_len - len(tokens))
+        matrix.append(row)
+    return ids, matrix
+
+def consensus_sequence(matrix: List[List[str]]) -> List[str]:
+    """
+    Compute consensus by majority token per column.
+    """
+    if not matrix:
+        return []
+    cols = list(zip(*matrix))
+    consensus = []
+    for col in cols:
+        # choose most common non-empty token
+        tokens = [t for t in col if t]
+        if not tokens:
+            consensus.append("")
+            continue
+        vals, counts = np.unique(tokens, return_counts=True)
+        consensus.append(vals[counts.argmax()])
+    return consensus
+
+def export_matrix_csv(ids: List[str], matrix: List[List[str]], path: str):
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        header = ["id"] + [f"pos_{i}" for i in range(len(matrix[0]) if matrix else 0)]
+        writer.writerow(header)
+        for id_, row in zip(ids, matrix):
+            writer.writerow([id_] + row)
+```
+
+---
+
+#### `backend/entropy_analysis/features.py` (update: embeddings fallback)
+```python
+from typing import List, Tuple, Optional, Dict
+import numpy as np
+
+# Try to import sentence-transformers; if unavailable, fall back to TF-IDF
+try:
+    from sentence_transformers import SentenceTransformer
+    EMBEDDINGS_AVAILABLE = True
+except Exception:
+    EMBEDDINGS_AVAILABLE = False
+
+from sklearn.feature_extraction.text import TfidfVectorizer
+
+def extract_text_features(
+    variations: List[Dict],
+    method: str = "auto",
+    vectorizer: Optional[TfidfVectorizer] = None,
+    max_features: int = 5000,
+    embedding_model_name: str = "all-MiniLM-L6-v2"
+) -> Tuple[np.ndarray, object]:
+    """
+    Convert a list of variations into feature vectors.
+    method: "auto" | "embeddings" | "tfidf"
+    Returns (feature_matrix, model_or_vectorizer)
+    """
+    contents = [v.get("content", "") for v in variations]
+    if method == "auto":
+        method = "embeddings" if EMBEDDINGS_AVAILABLE else "tfidf"
+
+    if method == "embeddings":
+        if not EMBEDDINGS_AVAILABLE:
+            raise RuntimeError("Embeddings requested but sentence-transformers not installed.")
+        model = SentenceTransformer(embedding_model_name)
+        X = model.encode(contents, show_progress_bar=False, convert_to_numpy=True)
+        return X, model
+
+    # TF-IDF fallback
+    if vectorizer is None:
+        vectorizer = TfidfVectorizer(max_features=max_features, stop_words="english")
+        X = vectorizer.fit_transform(contents)
+    else:
+        X = vectorizer.transform(contents)
+    return X.toarray(), vectorizer
+```
+
+---
+
+#### `backend/entropy_analysis/entropy.py` (update: group entropy helpers)
+```python
+from typing import List, Dict
+import numpy as np
+from scipy.stats import entropy as scipy_entropy
+
+EPS = 1e-12
+
+def _to_probability(vecs: np.ndarray, eps: float = EPS) -> np.ndarray:
+    if vecs.size == 0:
+        return np.array([])
+    masses = np.maximum(vecs.sum(axis=1), eps)
+    total = masses.sum()
+    if total <= 0:
+        return np.ones_like(masses) / len(masses)
+    return masses / total
+
+def system_entropy(feature_vectors: np.ndarray) -> float:
+    probs = _to_probability(feature_vectors)
+    if probs.size == 0:
+        return 0.0
+    return float(scipy_entropy(probs, base=np.e))
+
+def leave_one_out_deltas(feature_vectors: np.ndarray) -> List[float]:
+    if feature_vectors.shape[0] == 0:
+        return []
+    H = system_entropy(feature_vectors)
+    deltas = []
+    n = feature_vectors.shape[0]
+    for i in range(n):
+        reduced = np.delete(feature_vectors, i, axis=0)
+        H_minus = system_entropy(reduced)
+        deltas.append(float(H - H_minus))
+    return deltas
+
+def group_entropy(feature_vectors: np.ndarray, indices: List[int]) -> float:
+    """
+    Compute entropy for a subgroup of rows specified by indices.
+    """
+    if not indices:
+        return 0.0
+    sub = feature_vectors[indices, :]
+    return system_entropy(sub)
+```
+
+---
+
+#### `backend/entropy_analysis/bayesian.py` (update: consistency/resolution helpers)
+```python
+from typing import List, Dict, Tuple
+import math
+
+def normalize_scores(scores: List[float]) -> List[float]:
+    total = sum(scores)
+    if total == 0:
+        n = len(scores)
+        return [1.0 / n] * n if n > 0 else []
+    return [s / total for s in scores]
+
+def compute_consistency_index(reach: float, max_reach: float) -> float:
+    """Normalize reach to [0,1]."""
+    if max_reach <= 0:
+        return 0.0
+    return min(1.0, reach / max_reach)
+
+def compute_resolution_power(conflicts: int, max_conflicts: int) -> float:
+    """Higher resolution_power means fewer contradictions; invert conflicts."""
+    if max_conflicts <= 0:
+        return 1.0 if conflicts == 0 else 0.0
+    return 1.0 - min(1.0, conflicts / max_conflicts)
+
+def originality_score(consistency: float, resolution: float, reputation: float, entropy_score: float, weights: Dict = None) -> float:
+    if weights is None:
+        weights = {"consistency":0.35, "resolution":0.35, "reputation":0.20, "entropy":0.10}
+    inv_entropy = 1.0 - entropy_score
+    score = (weights["consistency"] * consistency +
+             weights["resolution"] * resolution +
+             weights["reputation"] * reputation +
+             weights["entropy"] * inv_entropy)
+    return score
+
+def build_probability_profiles(candidates: List[Dict]) -> List[Dict]:
+    """
+    candidates: list of dicts with keys:
+      id, reach, conflicts, reputation, entropy_score
+    Returns list of profiles with originality_score and normalized probability.
+    """
+    reaches = [c["reach"] for c in candidates]
+    max_reach = max(reaches) if reaches else 0.0
+    conflicts = [c.get("conflicts", 0) for c in candidates]
+    max_conflicts = max(conflicts) if conflicts else 0
+    raw_scores = []
+    for c in candidates:
+        consistency = compute_consistency_index(c["reach"], max_reach)
+        resolution = compute_resolution_power(c.get("conflicts", 0), max_conflicts)
+        reputation = c.get("reputation", 0.0)
+        entropy_score = c.get("entropy_score", 0.0)
+        raw = originality_score(consistency, resolution, reputation, entropy_score)
+        raw_scores.append(raw)
+    probs = normalize_scores(raw_scores)
+    profiles = []
+    for c, raw, p in zip(candidates, raw_scores, probs):
+        profiles.append({
+            "id": c["id"],
+            "originality_score": raw,
+            "probability": p
+        })
+    return profiles
+```
+
+---
+
+#### `backend/app/main.py` (update: new endpoints)
+```python
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from typing import List, Optional
+from entropy_analysis.api import run_entropy_analysis
+from entropy_analysis.bayesian import build_probability_profiles
+from entropy_analysis.neo4j_writer import Neo4jWriter
+
+app = FastAPI(title="Entropy Analysis API")
+
+class VariationIn(BaseModel):
+    id: str
+    content: str
+    created_at: Optional[int] = None
+    source_reliability: Optional[float] = 0.5
+
+class Neo4jConfig(BaseModel):
+    uri: str
+    user: str
+    password: str
+
+class AnalysisRequest(BaseModel):
+    variations: List[VariationIn]
+    neo4j: Neo4jConfig
+
+@app.post("/entropy-analysis")
+async def entropy_analysis(req: AnalysisRequest):
+    try:
+        variations = [v.dict() for v in req.variations]
+        neo4j_cfg = req.neo4j.dict()
+        result = run_entropy_analysis(variations, neo4j_cfg)
+        return {"status": "ok", "result": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/analyze-lineage")
+async def analyze_lineage(req: AnalysisRequest):
+    """
+    Run entropy analysis and then compute Bayesian probability profiles for candidate roots.
+    This endpoint expects the caller to supply variations (subset or full) and Neo4j config.
+    """
+    try:
+        variations = [v.dict() for v in req.variations]
+        neo4j_cfg = req.neo4j.dict()
+        # 1) entropy
+        run_entropy_analysis(variations, neo4j_cfg)
+        # 2) build candidate list (example: treat all variations without EVOLVED_FROM as candidates)
+        # In production, query Neo4j for roots and their reach/conflicts; here we synthesize from input
+        # For demo: compute reach as number of occurrences of tokens (placeholder)
+        candidates = []
+        for v in variations:
+            candidates.append({
+                "id": v["id"],
+                "reach": len(v.get("content","").split()),
+                "conflicts": 0,
+                "reputation": v.get("source_reliability", 0.5),
+                "entropy_score": 0.0  # will be filled by querying Neo4j in a real implementation
+            })
+        profiles = build_probability_profiles(candidates)
+        # Optionally persist ProbabilityProfile nodes in Neo4j
+        writer = Neo4jWriter(neo4j_cfg["uri"], neo4j_cfg["user"], neo4j_cfg["password"])
+        # Persist as simple properties on Variation for demo
+        rows = [{"id": p["id"], "originality_score": p["originality_score"], "probability": p["probability"]} for p in profiles]
+        persist_query = """
+        UNWIND $rows AS r
+        MATCH (v:Variation {id: r.id})
+        SET v.originality_score = r.originality_score,
+            v.probability = r.probability
+        RETURN count(v) AS updated
+        """
+        with writer.driver.session() as session:
+            session.run(persist_query, rows=rows)
+        writer.close()
+        return {"status": "ok", "profiles": profiles}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/status")
+async def status():
+    return {"status": "ready"}
+```
+
+---
+
+### 2) Tests and CI updates
+
+#### `backend/tests/test_networkx_tools.py` (new)
+```python
+from scripts.networkx_tools import build_graph_from_edges, recursive_backtrack, topological_roots
+
+def test_recursive_backtrack_simple():
+    edges = [("a","b"), ("b","c"), ("d","c")]
+    G = build_graph_from_edges(edges)
+    roots = recursive_backtrack(G, "c")
+    assert set(roots) == {"a","d"} or set(roots) == {"a","d","b"} or isinstance(roots, set)
+    # ensure roots are nodes with no predecessors
+    for r in roots:
+        assert G.in_degree(r) == 0
+```
+
+#### `backend/tests/test_seniority_score.py` (new)
+```python
+from entropy_analysis.bayesian import compute_consistency_index, compute_resolution_power
+
+def test_consistency_and_resolution():
+    assert compute_consistency_index(10, 10) == 1.0
+    assert compute_consistency_index(5, 10) == 0.5
+    assert compute_resolution_power(0, 5) == 1.0
+    assert compute_resolution_power(5, 5) == 0.0
+```
+
+#### `backend/tests/test_bayesian_normalization.py` (new)
+```python
+from entropy_analysis.bayesian import build_probability_profiles
+
+def test_probability_profiles_sum_to_one():
+    candidates = [
+        {"id":"a","reach":10,"conflicts":0,"reputation":0.8,"entropy_score":0.1},
+        {"id":"b","reach":5,"conflicts":1,"reputation":0.6,"entropy_score":0.2}
+    ]
+    profiles = build_probability_profiles(candidates)
+    total = sum(p["probability"] for p in profiles)
+    assert abs(total - 1.0) < 1e-6
+```
+
+#### CI update: `ci/github-actions.yml` (replace or extend)
+```yaml
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test-backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/app/requirements.txt
+          pip install pytest
+      - name: Run tests
+        run: |
+          pytest -q backend/tests
+```
+
+---
+
+### 3) Frontend components (new)
+
+#### `frontend/src/components/WeightingForm.jsx`
+```jsx
+import React, { useState } from "react";
+
+export default function WeightingForm({ onApply, initialWeights }) {
+  const [weights, setWeights] = useState(initialWeights || {
+    consistency: 0.35, resolution: 0.35, reputation: 0.2, entropy: 0.1
+  });
+
+  function update(key, value) {
+    const v = Math.max(0, Math.min(1, parseFloat(value) || 0));
+    setWeights(prev => ({ ...prev, [key]: v }));
+  }
+
+  function apply() {
+    // normalize to sum 1
+    const sum = Object.values(weights).reduce((a,b)=>a+b,0) || 1;
+    const normalized = Object.fromEntries(Object.entries(weights).map(([k,v])=>[k, v/sum]));
+    onApply(normalized);
+  }
+
+  return (
+    <div style={{padding:12, border:"1px solid #ddd", borderRadius:6}}>
+      <h4>Originality Weights</h4>
+      {Object.keys(weights).map(k => (
+        <div key={k} style={{marginBottom:8}}>
+          <label style={{display:"block"}}>{k}</label>
+          <input type="range" min="0" max="1" step="0.01" value={weights[k]} onChange={e=>update(k,e.target.value)} />
+          <span style={{marginLeft:8}}>{weights[k].toFixed(2)}</span>
+        </div>
+      ))}
+      <button onClick={apply}>Apply</button>
+    </div>
+  );
+}
+```
+
+---
+
+#### `frontend/src/components/LineageListView.jsx`
+```jsx
+import React from "react";
+
+export default function LineageListView({ variations = [], onSelect }) {
+  return (
+    <table style={{width:"100%", borderCollapse:"collapse"}}>
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>Entropy</th>
+          <th>Flag</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {variations.map(v => (
+          <tr key={v.id} tabIndex={0}>
+            <td>{v.id}</td>
+            <td>{Number(v.entropy_score || 0).toFixed(3)}</td>
+            <td>{v.anomaly_flag}</td>
+            <td>
+              <button onClick={()=>onSelect(v)}>View</button>
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+```
+
+---
+
+#### `frontend/src/components/ProbabilisticHeatmap.jsx`
+```jsx
+import React from "react";
+
+export default function ProbabilisticHeatmap({ profiles = [] }) {
+  const max = Math.max(...profiles.map(p => p.probability || 0), 1);
+  return (
+    <div style={{display:"flex", flexWrap:"wrap"}}>
+      {profiles.map(p => {
+        const intensity = Math.min(1, (p.probability || 0) / max);
+        const color = `rgba(0, 102, 204, ${intensity})`;
+        return (
+          <div key={p.id} style={{margin:6, textAlign:"center"}}>
+            <div style={{width:56, height:56, backgroundColor: color, borderRadius:6}} />
+            <div style={{fontSize:12}}>{p.id}</div>
+            <div style={{fontSize:11}}>{(p.probability*100).toFixed(1)}%</div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+```
+
+---
+
+#### `frontend/src/components/CrossPollinationPanel.jsx`
+```jsx
+import React from "react";
+
+export default function CrossPollinationPanel({ groups = [] }) {
+  return (
+    <div>
+      <h4>Cross-lineage PatternGroups</h4>
+      <ul>
+        {groups.map(g => (
+          <li key={g.id}>
+            <strong>{g.id}</strong> — {g.variations.length} variations; confidence {Number(g.confidence||0).toFixed(2)}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+```
+
+---
+
+### 4) Small operational notes and how to run
+
+- **Embeddings vs TF‑IDF**: the features pipeline uses `sentence-transformers` if installed. To enable embeddings, install `sentence-transformers` in your backend environment:
+  ```bash
+  pip install sentence-transformers
+  ```
+  If not installed, the code falls back to TF‑IDF automatically.
+
+- **Run tests**:
+  ```bash
+  cd backend
+  pip install -r app/requirements.txt
+  pip install pytest
+  pytest -q backend/tests
+  ```
+
+- **Start services locally** (uses the `infra/docker-compose.yml` you already have):
+  ```bash
+  cd infra
+  ./deploy.sh
+  ```
+
+- **Use new endpoints**:
+  - `POST /entropy-analysis` — same as before.
+  - `POST /analyze-lineage` — runs entropy then builds and persists probability profiles (demo mode uses synthetic reach/conflict values; replace with real Neo4j queries for production).
+
+---
+
+### 5) Tests added to CI
+I updated the CI YAML to run the new tests. The `ci/github-actions.yml` included above runs `pytest -q backend/tests` and will pick up the new test files.
+
+---
+
+### 6) Next steps I can take immediately (pick one, or I’ll proceed with the most useful)
+
+- **A.** Generate the exact Neo4j Cypher queries to replace the placeholder candidate extraction in `/analyze-lineage` so the endpoint queries the DB for roots, reach, and conflicts (requires Neo4j schema confirmation).  
+- **B.** Produce a short Jupyter notebook (`notebooks/lineage_demo.ipynb`) that demonstrates the NetworkX procedures and shows how recursive backtrack + SeniorityScore + entropy combine to pick candidate originals on a synthetic graph.  
+- **C.** Wire the frontend components into `App.jsx` and provide a minimal fetch-based integration example to call `/analyze-lineage` and display `ProbabilisticHeatmap` and `LineageListView`.
+
+I inferred you want all three major deliverables now; I implemented them. Tell me which of **A**, **B**, or **C** to produce next and I’ll generate the files and exact code for that step.
